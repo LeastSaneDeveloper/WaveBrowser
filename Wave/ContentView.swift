@@ -7,26 +7,29 @@ import UniformTypeIdentifiers
 
 final class BrowserTab: NSObject, ObservableObject, Identifiable {
     let id = UUID()
+    let containerFolder: URL
+    
     @Published var title: String
     @Published var url: URL?
     @Published var addressFieldText: String = ""
     @Published var preview: NSImage?
+    
     var webView: WKWebView?
 
-    init(title: String = "New Tab", url: URL? = nil) {
+    init(title: String = "New Tab", url: URL? = nil, dataStore: WKWebsiteDataStore, containerFolder: URL) {
         self.title = title
         self.url = url
         self.addressFieldText = url?.absoluteString ?? ""
+        self.containerFolder = containerFolder
         super.init()
 
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
-        config.websiteDataStore = .default()
-
+        config.websiteDataStore = dataStore
+        
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
-
         self.webView = webView
 
         if let initialURL = url {
@@ -69,12 +72,52 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         webView?.uiDelegate = nil
         webView?.stopLoading()
     }
+
+    func saveTabState() async throws {
+        guard let webView = webView else { return }
+        let state: [String: Any] = [
+            "url": webView.url?.absoluteString ?? "",
+            "title": title
+        ]
+        let fileURL = containerFolder.appendingPathComponent("\(self.id.uuidString).json")
+        let data = try JSONSerialization.data(withJSONObject: state)
+        try data.write(to: fileURL)
+    }
+    
+    func saveTabStateSync() {
+        guard let webView = webView else { return }
+        let state: [String: Any] = [
+            "url": webView.url?.absoluteString ?? "",
+            "title": title
+        ]
+        let fileURL = containerFolder.appendingPathComponent("\(self.id.uuidString).json")
+        if let data = try? JSONSerialization.data(withJSONObject: state) {
+            try? data.write(to: fileURL)
+        }
+    }
 }
 
 struct TabContainer: Identifiable {
     let id = UUID()
     var name: String
     var tabs: [BrowserTab]
+    var folderURL: URL
+    var dataStore: WKWebsiteDataStore
+}
+
+extension TabContainer {
+    static func create(name: String) -> TabContainer {
+        let baseFolder = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("BrowserContainers")
+        let folder = baseFolder.appendingPathComponent(name)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        let store = WKWebsiteDataStore.default()
+
+        let tab = BrowserTab(title: "New Tab", url: nil, dataStore: store, containerFolder: folder)
+        return TabContainer(name: name, tabs: [tab], folderURL: folder, dataStore: store)
+    }
 }
 
 struct TabReorderDelegate: DropDelegate {
@@ -120,9 +163,7 @@ struct TabReorderDelegate: DropDelegate {
 // MARK: - Main View
 
 struct ContentView: View {
-    @State private var containers: [TabContainer] = [
-        TabContainer(name: "Tabs", tabs: [BrowserTab(title: "New Tab", url: nil)])
-    ]
+    @State private var containers: [TabContainer] = []
     @State private var selectedContainerIndex: Int = 0
     @State private var selectedTabIndex: Int = 0
     @State private var showingTabOverview = false
@@ -152,6 +193,76 @@ struct ContentView: View {
         .accentColor(.white)
         .sheet(isPresented: $showingSettings) {
             SettingsView()
+        }
+    }
+    
+    // MARK: Load Containers
+    
+    init() {
+        let loaded = Self.loadContainers()
+        
+        if loaded.isEmpty {
+            // No saved containers: create a default one
+            _containers = State(initialValue: [TabContainer.create(name: "Tabs")])
+            _selectedContainerIndex = State(initialValue: 0)
+            _selectedTabIndex = State(initialValue: 0)
+        } else {
+            // Fix containers that have zero tabs
+            let fixedContainers = loaded.map { container -> TabContainer in
+                var c = container
+                if c.tabs.isEmpty {
+                    let tab = BrowserTab(
+                        title: "New Tab",
+                        url: nil,
+                        dataStore: c.dataStore,
+                        containerFolder: c.folderURL
+                    )
+                    c.tabs = [tab]
+                }
+                return c
+            }
+            _containers = State(initialValue: fixedContainers)
+            _selectedContainerIndex = State(initialValue: 0)
+            // Ensure selectedTabIndex is valid
+            _selectedTabIndex = State(initialValue: fixedContainers[0].tabs.isEmpty ? 0 : 0)
+        }
+    }
+    
+    func saveAllTabsSync() {
+        for container in containers {
+            for tab in container.tabs {
+                tab.saveTabStateSync()
+            }
+        }
+    }
+    
+    static func loadContainers() -> [TabContainer] {
+        let baseFolder = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("BrowserContainers")
+        
+        guard let folderNames = try? FileManager.default.contentsOfDirectory(atPath: baseFolder.path) else { return [] }
+        
+        return folderNames.compactMap { name in
+            let folder = baseFolder.appendingPathComponent(name)
+            let store = WKWebsiteDataStore.default()
+            
+            let tabFiles = (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.filter { $0.hasSuffix(".json") } ?? []
+            let tabs = tabFiles.compactMap { fileName -> BrowserTab? in
+                let fileURL = folder.appendingPathComponent(fileName)
+                guard
+                    let data = try? Data(contentsOf: fileURL),
+                    let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let urlString = dict["url"] as? String,
+                    let url = URL(string: urlString)
+                else { return nil }
+                
+                let title = dict["title"] as? String ?? "New Tab"
+                
+                return BrowserTab(title: title, url: url, dataStore: store, containerFolder: folder)
+            }
+            
+            return TabContainer(name: name, tabs: tabs, folderURL: folder, dataStore: store)
         }
     }
     
@@ -215,7 +326,7 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     ForEach(Array(containers[selectedContainerIndex].tabs.enumerated()), id: \.element.id) { offset, tab in
                         TabButton(
-                            title: tab.title,
+                            tab: tab,
                             isSelected: offset == selectedTabIndex,
                             namespace: tabNamespace,
                             closeAction: { closeTab(at: offset) }
@@ -271,6 +382,7 @@ struct ContentView: View {
     private var tabOverview: some View {
         VStack(spacing: 0) {
             HStack {
+                Spacer()
                 TextField("Search \(containers[selectedContainerIndex].name)...", text: $searchQuery)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                     .frame(width: 300)
@@ -413,23 +525,44 @@ struct ContentView: View {
     
     private func addTab() {
         withAnimation(.spring()) {
-            let newTab = BrowserTab(title: "New Tab", url: nil)
+            let container = containers[selectedContainerIndex]
+            let newTab = BrowserTab(
+                title: "New Tab",
+                url: nil,
+                dataStore: container.dataStore,
+                containerFolder: container.folderURL
+            )
             containers[selectedContainerIndex].tabs.append(newTab)
             selectedTabIndex = containers[selectedContainerIndex].tabs.count - 1
         }
     }
     
     private func closeTab(at index: Int) {
+        guard containers.indices.contains(selectedContainerIndex),
+              containers[selectedContainerIndex].tabs.indices.contains(index) else { return }
+
         let tab = containers[selectedContainerIndex].tabs[index]
+        Task {
+            try? await tab.saveTabState()
+        }
         tab.close()
-        
+
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             containers[selectedContainerIndex].tabs.remove(at: index)
+
+            // Ensure there's always at least one tab
             if containers[selectedContainerIndex].tabs.isEmpty {
                 addTab()
                 selectedTabIndex = 0
             } else if selectedTabIndex >= containers[selectedContainerIndex].tabs.count {
+                // If we closed the last tab, move selection to the previous tab
                 selectedTabIndex = containers[selectedContainerIndex].tabs.count - 1
+            } else if selectedTabIndex > index {
+                // If a tab before the selected tab was removed, adjust the index
+                selectedTabIndex -= 1
+            } else if selectedTabIndex == index {
+                // If we closed the currently selected tab, select the previous one if possible
+                selectedTabIndex = max(0, index - 1)
             }
         }
     }
@@ -437,8 +570,9 @@ struct ContentView: View {
     private func addContainer(named name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
+        
         withAnimation(.spring()) {
-            let newContainer = TabContainer(name: trimmed, tabs: [])
+            let newContainer = TabContainer.create(name: trimmed)
             containers.append(newContainer)
             selectedContainerIndex = containers.count - 1
         }
@@ -455,7 +589,8 @@ struct ContentView: View {
     
     private func clearDataAndCloseTabs() {
         withAnimation(.spring()) {
-            containers = [TabContainer(name: "Tabs", tabs: [BrowserTab(title: "New Tab", url: nil)])]
+            let newContainer = TabContainer.create(name: "Tabs")
+            containers = [newContainer]
             selectedContainerIndex = 0
             selectedTabIndex = 0
         }
@@ -512,7 +647,7 @@ struct WebViewContainer: NSViewRepresentable {
 // MARK: - Tab Button
 
 struct TabButton: View {
-    let title: String
+    @ObservedObject var tab: BrowserTab
     let isSelected: Bool
     var namespace: Namespace.ID
     let closeAction: () -> Void
@@ -528,7 +663,7 @@ struct TabButton: View {
                         .frame(height: 28)
                 }
                 HStack(spacing: 6) {
-                    Text(title)
+                    Text(tab.title)
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(.white)
                         .minimumScaleFactor(0.6)
