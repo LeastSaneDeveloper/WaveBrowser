@@ -1,14 +1,44 @@
 import SwiftUI
 import WebKit
+import Combine
 
 // MARK: - Models
 
-struct BrowserTab: Identifiable, Equatable {
+final class BrowserTab: NSObject, ObservableObject, Identifiable {
     let id = UUID()
-    var title: String
-    var url: URL?
-    var webView: WKWebView? = WKWebView()
-    var preview: NSImage?
+    @Published var title: String
+    @Published var url: URL?
+    @Published var addressFieldText: String = ""
+    @Published var preview: NSImage?
+
+    // Add this line:
+    var webView: WKWebView?
+
+    init(title: String = "New Tab", url: URL? = nil) {
+        self.title = title
+        self.url = url
+        self.addressFieldText = url?.absoluteString ?? ""
+        super.init()
+
+        let config = WKWebViewConfiguration()
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        config.websiteDataStore = .default()
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+
+        self.webView = webView
+
+        if let initialURL = url {
+            webView.load(URLRequest(url: initialURL))
+        }
+    }
+
+    func load(url: URL) {
+        self.url = url
+        self.addressFieldText = url.absoluteString
+        webView?.load(URLRequest(url: url))  // Ensure the tab’s own webView loads it
+    }
 }
 
 struct TabContainer: Identifiable {
@@ -23,6 +53,7 @@ struct ContentView: View {
     @State private var containers: [TabContainer] = [
         TabContainer(name: "Tabs", tabs: [BrowserTab(title: "New Tab", url: nil)])
     ]
+    @State private var activeWebView: WKWebView?
     @State private var selectedContainerIndex: Int = 0
     @State private var selectedTabIndex: Int = 0
     @State private var showingTabOverview = false
@@ -40,7 +71,8 @@ struct ContentView: View {
                     Divider().background(Color.gray.opacity(0.4))
                     tabsBar
                     Divider().background(Color.gray.opacity(0.4))
-                    WebViewContainer(tab: $containers[selectedContainerIndex].tabs[selectedTabIndex])
+                    WebViewContainer(tab: containers[selectedContainerIndex].tabs[selectedTabIndex])
+                        .id(containers[selectedContainerIndex].tabs[selectedTabIndex].id)
                 }
                 .transition(.move(edge: .bottom))
             } else {
@@ -71,7 +103,8 @@ struct ContentView: View {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 15))
                 }
-                WebAddressField(url: $containers[selectedContainerIndex].tabs[selectedTabIndex].url)
+                WebAddressField(tab: containers[selectedContainerIndex].tabs[selectedTabIndex])
+                    .id(containers[selectedContainerIndex].tabs[selectedTabIndex].id)
                     .frame(width: 300)
                 Button(action: {}) {
                     Image(systemName: "shield.lefthalf.fill")
@@ -276,9 +309,13 @@ struct ContentView: View {
     }
     
     // MARK: Actions
-    private func goBack() { containers[selectedContainerIndex].tabs[selectedTabIndex].webView?.goBack() }
-    private func goForward() { containers[selectedContainerIndex].tabs[selectedTabIndex].webView?.goForward() }
-    private func reload() { containers[selectedContainerIndex].tabs[selectedTabIndex].webView?.reload() }
+    private var currentWebView: WKWebView? {
+        containers[selectedContainerIndex].tabs[selectedTabIndex].webView
+    }
+
+    private func goBack() { currentWebView?.goBack() }
+    private func goForward() { currentWebView?.goForward() }
+    private func reload() { currentWebView?.reload() }
     
     private func addTab() {
         withAnimation(.spring()) {
@@ -330,11 +367,11 @@ struct ContentView: View {
     private func capturePreviews() {
         for i in containers.indices {
             for j in containers[i].tabs.indices {
-                containers[i].tabs[j].webView?.takeSnapshot(with: nil, completionHandler: { image, _ in
+                activeWebView?.takeSnapshot(with: nil) { image, _ in
                     if let cgImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
                         containers[i].tabs[j].preview = NSImage(cgImage: cgImage, size: NSSize(width: 400, height: 300))
                     }
-                })
+                }
             }
         }
     }
@@ -343,20 +380,38 @@ struct ContentView: View {
 // MARK: - WebView
 
 struct WebViewContainer: NSViewRepresentable {
-    @Binding var tab: BrowserTab
-    
+    @ObservedObject var tab: BrowserTab
+
+    func makeCoordinator() -> Coordinator { Coordinator(tab: tab) }
+
     func makeNSView(context: Context) -> WKWebView {
-        let webView = tab.webView ?? WKWebView()
-        if let url = tab.url {
-            webView.load(URLRequest(url: url))
-        }
-        tab.webView = webView
+        let webView = tab.webView!
+        webView.navigationDelegate = context.coordinator
         return webView
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) {
-        if let url = tab.url, nsView.url != url {
-            nsView.load(URLRequest(url: url))
+    func updateNSView(_ nsView: WKWebView, context: Context) { }
+
+    class Coordinator: NSObject, WKNavigationDelegate {
+        var tab: BrowserTab
+        init(tab: BrowserTab) { self.tab = tab }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            DispatchQueue.main.async {
+                self.tab.url = webView.url
+                self.tab.addressFieldText = webView.url?.absoluteString ?? ""
+                if let title = webView.title, !title.isEmpty {
+                    self.tab.title = title
+                }
+            }
+        }
+
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
+            if let scheme = url.scheme?.lowercased(), ["http", "https", "about"].contains(scheme) {
+                decisionHandler(.allow)
+            } else { decisionHandler(.cancel) }
         }
     }
 }
@@ -403,21 +458,26 @@ struct TabButton: View {
 // MARK: - Address Field
 
 struct WebAddressField: View {
-    @Binding var url: URL?
+    @ObservedObject var tab: BrowserTab
 
     var body: some View {
-        TextField("Search or enter an address...", text: Binding(
-            get: { url?.absoluteString ?? "" },
-            set: { newValue in
-                if let newURL = URL(string: newValue), !newValue.isEmpty {
-                    url = newURL
-                } else {
-                    url = nil
-                }
-            }
-        ))
-        .textFieldStyle(RoundedBorderTextFieldStyle())
-        .foregroundColor(.white)
+        TextField("Search or enter an address...",
+                  text: $tab.addressFieldText,
+                  onCommit: commit)
+            .textFieldStyle(RoundedBorderTextFieldStyle())
+    }
+
+    private func commit() {
+        var raw = tab.addressFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
+
+        if !raw.hasPrefix("http://") && !raw.hasPrefix("https://") {
+            raw = "https://\(raw)"
+        }
+
+        guard let url = URL(string: raw), url.host != nil else { return }
+
+        tab.load(url: url)
     }
 }
 
