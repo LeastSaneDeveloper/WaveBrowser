@@ -11,8 +11,6 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     @Published var url: URL?
     @Published var addressFieldText: String = ""
     @Published var preview: NSImage?
-
-    // Add this line:
     var webView: WKWebView?
 
     init(title: String = "New Tab", url: URL? = nil) {
@@ -26,6 +24,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         config.websiteDataStore = .default()
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
 
         self.webView = webView
@@ -40,6 +39,15 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         self.addressFieldText = url.absoluteString
         webView?.load(URLRequest(url: url))
     }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "URL", let webView = object as? WKWebView {
+            DispatchQueue.main.async {
+                self.url = webView.url
+                self.addressFieldText = webView.url?.absoluteString ?? ""
+            }
+        }
+    }
     
     func close() {
         guard let webView = webView else { return }
@@ -51,11 +59,8 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         // Clear delegates
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
-
-        // Remove from superview
+        
         webView.removeFromSuperview()
-
-        // Release reference
         self.webView = nil
     }
 
@@ -118,7 +123,6 @@ struct ContentView: View {
     @State private var containers: [TabContainer] = [
         TabContainer(name: "Tabs", tabs: [BrowserTab(title: "New Tab", url: nil)])
     ]
-    @State private var activeWebView: WKWebView?
     @State private var selectedContainerIndex: Int = 0
     @State private var selectedTabIndex: Int = 0
     @State private var showingTabOverview = false
@@ -389,7 +393,6 @@ struct ContentView: View {
             .foregroundColor(.white)
         }
         .background(Color.black.edgesIgnoringSafeArea(.all))
-        .onAppear(perform: capturePreviews)
     }
     
     // MARK: Filtered Tabs
@@ -457,18 +460,6 @@ struct ContentView: View {
             selectedTabIndex = 0
         }
     }
-    
-    private func capturePreviews() {
-        for i in containers.indices {
-            for j in containers[i].tabs.indices {
-                activeWebView?.takeSnapshot(with: nil) { image, _ in
-                    if let cgImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                        containers[i].tabs[j].preview = NSImage(cgImage: cgImage, size: NSSize(width: 400, height: 300))
-                    }
-                }
-            }
-        }
-    }
 }
 
 // MARK: - WebView
@@ -496,6 +487,14 @@ struct WebViewContainer: NSViewRepresentable {
                 self.tab.addressFieldText = webView.url?.absoluteString ?? ""
                 if let title = webView.title, !title.isEmpty {
                     self.tab.title = title
+                }
+
+                let config = WKSnapshotConfiguration()
+                config.afterScreenUpdates = true
+                webView.takeSnapshot(with: config) { image, _ in
+                    if let cgImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                        self.tab.preview = NSImage(cgImage: cgImage, size: NSSize(width: 400, height: 300))
+                    }
                 }
             }
         }
@@ -555,23 +554,39 @@ struct WebAddressField: View {
     @ObservedObject var tab: BrowserTab
 
     var body: some View {
-        TextField("Search or enter an address...",
-                  text: $tab.addressFieldText,
-                  onCommit: commit)
-            .textFieldStyle(RoundedBorderTextFieldStyle())
+        TextField(
+            "Search or enter an address...",
+            text: $tab.addressFieldText,
+            onEditingChanged: { isEditing in
+                if !isEditing {
+                    if tab.addressFieldText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        tab.addressFieldText = tab.url?.absoluteString ?? tab.url?.absoluteString ?? ""
+                    }
+                }
+            },
+            onCommit: commit
+        )
+        .textFieldStyle(RoundedBorderTextFieldStyle())
     }
 
     private func commit() {
-        var raw = tab.addressFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return }
-
-        if !raw.hasPrefix("http://") && !raw.hasPrefix("https://") {
-            raw = "https://\(raw)"
+        let raw = tab.addressFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard !raw.isEmpty else {
+            tab.addressFieldText = tab.url?.absoluteString ?? ""
+            return
         }
 
-        guard let url = URL(string: raw), url.host != nil else { return }
+        var urlString = raw
+        if !urlString.hasPrefix("http://") && !urlString.hasPrefix("https://") {
+            urlString = "https://\(urlString)"
+        }
 
-        tab.load(url: url)
+        guard let url = URL(string: urlString), url.host != nil else { return }
+
+        if tab.url != url {
+            tab.load(url: url)
+        }
     }
 }
 
