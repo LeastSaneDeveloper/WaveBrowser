@@ -1,6 +1,7 @@
 import SwiftUI
 import WebKit
 import Combine
+import UniformTypeIdentifiers
 
 // MARK: - Models
 
@@ -41,11 +42,21 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     }
     
     func close() {
-        webView?.navigationDelegate = nil
-        webView?.uiDelegate = nil
-        webView?.stopLoading()
-        webView?.removeFromSuperview()
-        webView = nil
+        guard let webView = webView else { return }
+
+        // Stop everything and load blank page
+        webView.stopLoading()
+        webView.load(URLRequest(url: URL(string: "about:blank")!))
+
+        // Clear delegates
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+
+        // Remove from superview
+        webView.removeFromSuperview()
+
+        // Release reference
+        self.webView = nil
     }
 
     deinit {
@@ -59,6 +70,46 @@ struct TabContainer: Identifiable {
     let id = UUID()
     var name: String
     var tabs: [BrowserTab]
+}
+
+struct TabReorderDelegate: DropDelegate {
+    @Binding var containers: [TabContainer]
+    let containerIndex: Int
+    let current: BrowserTab
+    let currentIndex: Int
+    @Binding var selectedTabIndex: Int
+    
+    func performDrop(info: DropInfo) -> Bool { true }
+    
+    func dropEntered(info: DropInfo) {
+        guard
+            let item = info.itemProviders(for: [UTType.plainText]).first
+        else { return }
+
+        item.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { data, _ in
+            guard
+                let d = data as? Data,
+                let str = String(data: d, encoding: .utf8),
+                let draggedID = UUID(uuidString: str),
+                let fromIndex = containers[containerIndex].tabs.firstIndex(where: { $0.id == draggedID }),
+                fromIndex != currentIndex
+            else { return }
+
+            DispatchQueue.main.async {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    let tab = containers[containerIndex].tabs.remove(at: fromIndex)
+                    containers[containerIndex].tabs.insert(tab, at: currentIndex)
+
+                    if selectedTabIndex == fromIndex { selectedTabIndex = currentIndex }
+                    else if selectedTabIndex >= min(fromIndex, currentIndex)
+                            && selectedTabIndex <= max(fromIndex, currentIndex) {
+                        if fromIndex < currentIndex { selectedTabIndex -= 1 }
+                        else { selectedTabIndex += 1 }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Main View
@@ -158,19 +209,44 @@ struct ContentView: View {
         HStack(spacing: 6) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    ForEach(containers[selectedContainerIndex].tabs) { tab in
-                        let index = containers[selectedContainerIndex].tabs.firstIndex(where: { $0.id == tab.id })!
+                    ForEach(Array(containers[selectedContainerIndex].tabs.enumerated()), id: \.element.id) { offset, tab in
                         TabButton(
                             title: tab.title,
-                            isSelected: index == selectedTabIndex,
+                            isSelected: offset == selectedTabIndex,
                             namespace: tabNamespace,
-                            closeAction: { closeTab(at: index) }
+                            closeAction: { closeTab(at: offset) }
                         ) {
                             withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                                selectedTabIndex = index
+                                selectedTabIndex = offset
                             }
                         }
                         .frame(minWidth: 80)
+                        .onDrag {
+                            let provider = NSItemProvider()
+                            let idString = tab.id.uuidString
+
+                            provider.registerDataRepresentation(
+                                forTypeIdentifier: UTType.plainText.identifier,
+                                visibility: .all
+                            ) { completion in
+                                Task { @MainActor in
+                                    completion(idString.data(using: .utf8), nil)
+                                }
+                                return nil
+                            }
+
+                            return provider
+                        }
+                        .onDrop(
+                            of: [.text],
+                            delegate: TabReorderDelegate(
+                                containers: $containers,
+                                containerIndex: selectedContainerIndex,
+                                current: tab,
+                                currentIndex: offset,
+                                selectedTabIndex: $selectedTabIndex
+                            )
+                        )
                     }
                     Button(action: addTab) {
                         Image(systemName: "plus")
