@@ -37,7 +37,21 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     func load(url: URL) {
         self.url = url
         self.addressFieldText = url.absoluteString
-        webView?.load(URLRequest(url: url))  // Ensure the tab’s own webView loads it
+        webView?.load(URLRequest(url: url))
+    }
+    
+    func close() {
+        webView?.navigationDelegate = nil
+        webView?.uiDelegate = nil
+        webView?.stopLoading()
+        webView?.removeFromSuperview()
+        webView = nil
+    }
+
+    deinit {
+        webView?.navigationDelegate = nil
+        webView?.uiDelegate = nil
+        webView?.stopLoading()
     }
 }
 
@@ -144,9 +158,10 @@ struct ContentView: View {
         HStack(spacing: 6) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    ForEach(containers[selectedContainerIndex].tabs.indices, id: \.self) { index in
+                    ForEach(containers[selectedContainerIndex].tabs) { tab in
+                        let index = containers[selectedContainerIndex].tabs.firstIndex(where: { $0.id == tab.id })!
                         TabButton(
-                            title: containers[selectedContainerIndex].tabs[index].title,
+                            title: tab.title,
                             isSelected: index == selectedTabIndex,
                             namespace: tabNamespace,
                             closeAction: { closeTab(at: index) }
@@ -326,6 +341,9 @@ struct ContentView: View {
     }
     
     private func closeTab(at index: Int) {
+        let tab = containers[selectedContainerIndex].tabs[index]
+        tab.close()
+        
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             containers[selectedContainerIndex].tabs.remove(at: index)
             if containers[selectedContainerIndex].tabs.isEmpty {
