@@ -230,6 +230,14 @@ struct ContentView: View {
     
     func saveAllTabsSync() {
         for container in containers {
+            let folder = container.folderURL
+            let existingFiles = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+            let currentTabIDs = Set(container.tabs.map { $0.id.uuidString + ".json" })
+            
+            for file in existingFiles where file.hasSuffix(".json") && !currentTabIDs.contains(file) {
+                try? FileManager.default.removeItem(at: folder.appendingPathComponent(file))
+            }
+            
             for tab in container.tabs {
                 tab.saveTabStateSync()
             }
