@@ -171,7 +171,12 @@ struct ContentView: View {
     @State private var showingNewContainerPopover = false
     @State private var newContainerName = ""
     @State private var searchQuery: String = ""
+    
     @Namespace private var tabNamespace
+    
+    private let MAX_TAB_WIDTH: CGFloat = 180
+    private let MIN_TAB_WIDTH: CGFloat = 80
+    private let TAB_SPACING: CGFloat = 6
     
     var body: some View {
         ZStack {
@@ -329,61 +334,76 @@ struct ContentView: View {
     
     // MARK: Tabs Bar
     private var tabsBar: some View {
-        HStack(spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(Array(containers[selectedContainerIndex].tabs.enumerated()), id: \.element.id) { offset, tab in
-                        TabButton(
-                            tab: tab,
-                            isSelected: offset == selectedTabIndex,
-                            namespace: tabNamespace,
-                            closeAction: { closeTab(at: offset) }
-                        ) {
-                            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                                selectedTabIndex = offset
-                            }
-                        }
-                        .frame(minWidth: 80)
-                        .onDrag {
-                            let provider = NSItemProvider()
-                            let idString = tab.id.uuidString
+        GeometryReader { geometry in
+            HStack(spacing: TAB_SPACING) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: TAB_SPACING) {
 
-                            provider.registerDataRepresentation(
-                                forTypeIdentifier: UTType.plainText.identifier,
-                                visibility: .all
-                            ) { completion in
-                                Task { @MainActor in
-                                    completion(idString.data(using: .utf8), nil)
+                        let tabCount = CGFloat(containers[selectedContainerIndex].tabs.count)
+                        let plusButtonWidth: CGFloat = 20
+                        let totalFixedSpace: CGFloat = 32 + plusButtonWidth + TAB_SPACING
+                        let availableWidthForTabs = geometry.size.width - totalFixedSpace
+                        let totalSpacingBetweenTabs = tabCount > 0 ? (tabCount - 1) * TAB_SPACING : 0
+                        let idealWidth = tabCount > 0 ? (availableWidthForTabs - totalSpacingBetweenTabs) / tabCount : MAX_TAB_WIDTH
+                        let tabWidth: CGFloat = min(MAX_TAB_WIDTH, max(MIN_TAB_WIDTH, idealWidth))
+                        
+                        ForEach(Array(containers[selectedContainerIndex].tabs.enumerated()), id: \.element.id) { offset, tab in
+                            TabButton(
+                                tab: tab,
+                                isSelected: offset == selectedTabIndex,
+                                namespace: tabNamespace,
+                                closeAction: { closeTab(at: offset) }
+                            ) {
+                                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                                    selectedTabIndex = offset
                                 }
-                                return nil
                             }
+                            // Apply the calculated dynamic width
+                            .frame(width: tabWidth)
+                            .onDrag {
+                                let provider = NSItemProvider()
+                                let idString = tab.id.uuidString
 
-                            return provider
-                        }
-                        .onDrop(
-                            of: [.text],
-                            delegate: TabReorderDelegate(
-                                containers: $containers,
-                                containerIndex: selectedContainerIndex,
-                                current: tab,
-                                currentIndex: offset,
-                                selectedTabIndex: $selectedTabIndex
+                                provider.registerDataRepresentation(
+                                    forTypeIdentifier: UTType.plainText.identifier,
+                                    visibility: .all
+                                ) { completion in
+                                    Task { @MainActor in
+                                        completion(idString.data(using: .utf8), nil)
+                                    }
+                                    return nil
+                                }
+                                return provider
+                            }
+                            .onDrop(
+                                of: [.text],
+                                delegate: TabReorderDelegate(
+                                    containers: $containers,
+                                    containerIndex: selectedContainerIndex,
+                                    current: tab,
+                                    currentIndex: offset,
+                                    selectedTabIndex: $selectedTabIndex
+                                )
                             )
-                        )
+                        }
+                        
+                        Button(action: addTab) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 16))
+                        }
+                        .frame(width: plusButtonWidth)
                     }
-                    Button(action: addTab) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 16))
-                    }
+                    .frame(minWidth: geometry.size.width - 32 - TAB_SPACING, alignment: .leading)
                 }
             }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.black)
+            .buttonStyle(PlainButtonStyle())
+            .foregroundColor(.white)
+            .animation(.spring(response: 0.4, dampingFraction: 0.8), value: containers[selectedContainerIndex].tabs.count)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 6)
-        .background(Color.black)
-        .buttonStyle(PlainButtonStyle())
-        .foregroundColor(.white)
-        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: containers[selectedContainerIndex].tabs.count)
+        .frame(height: 40) // Give the GeometryReader a fixed height, matching the bar's height
     }
     
     // MARK: Tab Overview
@@ -663,24 +683,35 @@ struct TabButton: View {
     
     var body: some View {
         Button(action: action) {
-            ZStack(alignment: .center) {
+            ZStack {
                 if isSelected {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color.blue.opacity(0.8))
                         .matchedGeometryEffect(id: "tabHighlight", in: namespace)
                         .frame(height: 28)
                 }
-                HStack(spacing: 6) {
+
+                HStack {
+                    Color.clear
+                        .frame(width: 20)
+
+                    Spacer()
+
                     Text(tab.title)
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(.white)
                         .minimumScaleFactor(0.6)
                         .lineLimit(1)
+
+                    Spacer()
+
+                    // Right close button
                     Button(action: closeAction) {
                         Image(systemName: "xmark")
                             .font(.system(size: 10, weight: .bold))
                             .foregroundColor(.white.opacity(0.8))
                     }
+                    .frame(width: 20)
                     .buttonStyle(PlainButtonStyle())
                 }
                 .padding(.horizontal, 8)
