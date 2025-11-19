@@ -29,6 +29,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
+        webView.addObserver(self, forKeyPath: "title", options: .new, context: nil)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
         self.webView = webView
 
@@ -48,6 +49,14 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
             DispatchQueue.main.async {
                 self.url = webView.url
                 self.addressFieldText = webView.url?.absoluteString ?? ""
+                self.persistState()
+            }
+        } else if keyPath == "title", let webView = object as? WKWebView {
+            DispatchQueue.main.async {
+                if let newTitle = webView.title, !newTitle.isEmpty {
+                    self.title = newTitle
+                    self.persistState()
+                }
             }
         }
     }
@@ -95,6 +104,12 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
             try? data.write(to: fileURL)
         }
     }
+    
+    func persistState() {
+        Task {
+            try? await saveTabState()
+        }
+    }
 }
 
 struct TabContainer: Identifiable {
@@ -109,14 +124,21 @@ extension TabContainer {
     static func create(name: String) -> TabContainer {
         let baseFolder = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("BrowserContainers")
-        let folder = baseFolder.appendingPathComponent(name)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            .appendingPathComponent("WaveData")
+            .appendingPathComponent("Containers")
+            
+        let containerFolder = baseFolder.appendingPathComponent(name)
+        
+        let websiteDataStoreSubfolder = containerFolder.appendingPathComponent("Cache")
+        
+        try? FileManager.default.createDirectory(at: containerFolder, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: websiteDataStoreSubfolder, withIntermediateDirectories: true)
+        
+        let storeID = UUID(uuidString: name) ?? UUID()
+        let store = WKWebsiteDataStore(forIdentifier: storeID)
 
-        let store = WKWebsiteDataStore.default()
-
-        let tab = BrowserTab(title: "New Tab", url: nil, dataStore: store, containerFolder: folder)
-        return TabContainer(name: name, tabs: [tab], folderURL: folder, dataStore: store)
+        let tab = BrowserTab(title: "New Tab", url: nil, dataStore: store, containerFolder: containerFolder)
+        return TabContainer(name: name, tabs: [tab], folderURL: containerFolder, dataStore: store)
     }
 }
 
@@ -251,31 +273,35 @@ struct ContentView: View {
     
     static func loadContainers() -> [TabContainer] {
         let baseFolder = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("BrowserContainers")
+                    .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("WaveData")
+                    .appendingPathComponent("Containers")
         
         guard let folderNames = try? FileManager.default.contentsOfDirectory(atPath: baseFolder.path) else { return [] }
         
         return folderNames.compactMap { name in
-            let folder = baseFolder.appendingPathComponent(name)
-            let store = WKWebsiteDataStore.default()
+            let containerFolder = baseFolder.appendingPathComponent(name)
             
-            let tabFiles = (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.filter { $0.hasSuffix(".json") } ?? []
+            let storeID = UUID(uuidString: name) ?? UUID()
+            let store = WKWebsiteDataStore(forIdentifier: storeID)
+            
+            let tabFiles = (try? FileManager.default.contentsOfDirectory(atPath: containerFolder.path))?.filter { $0.hasSuffix(".json") } ?? []
+            
             let tabs = tabFiles.compactMap { fileName -> BrowserTab? in
-                let fileURL = folder.appendingPathComponent(fileName)
+                let fileURL = containerFolder.appendingPathComponent(fileName)
                 guard
                     let data = try? Data(contentsOf: fileURL),
                     let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let urlString = dict["url"] as? String,
-                    let url = URL(string: urlString)
+                    let urlString = dict["url"] as? String
                 else { return nil }
-                
+                    
+                let url = URL(string: urlString)
                 let title = dict["title"] as? String ?? "New Tab"
-                
-                return BrowserTab(title: title, url: url, dataStore: store, containerFolder: folder)
+                    
+                return BrowserTab(title: title, url: url, dataStore: store, containerFolder: containerFolder)
             }
             
-            return TabContainer(name: name, tabs: tabs, folderURL: folder, dataStore: store)
+            return TabContainer(name: name, tabs: tabs, folderURL: containerFolder, dataStore: store)
         }
     }
     
@@ -562,6 +588,7 @@ struct ContentView: View {
             )
             containers[selectedContainerIndex].tabs.append(newTab)
             selectedTabIndex = containers[selectedContainerIndex].tabs.count - 1
+            newTab.persistState()
         }
     }
     
@@ -760,6 +787,7 @@ struct WebAddressField: View {
 
         if tab.url != url {
             tab.load(url: url)
+            tab.persistState()
         }
     }
 }
