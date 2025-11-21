@@ -129,6 +129,47 @@ struct TabGroup: Identifiable {
     var dataStore: WKWebsiteDataStore
 }
 
+struct TabGroupsManager {
+    static let baseFolder: URL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("WaveData")
+        .appendingPathComponent("TabGroups")
+
+    static func saveGroups(_ groups: [TabGroup]) {
+        try? FileManager.default.createDirectory(at: baseFolder, withIntermediateDirectories: true)
+
+        for group in groups {
+            group.saveAllTabs()
+        }
+
+        let summary = groups.map { ["name": $0.name, "folder": $0.folderURL.path] }
+        let fileURL = baseFolder.appendingPathComponent("groups.json")
+        if let data = try? JSONSerialization.data(withJSONObject: summary) {
+            try? data.write(to: fileURL)
+        }
+    }
+
+    static func loadGroups() -> [TabGroup] {
+        let fileURL = baseFolder.appendingPathComponent("groups.json")
+        guard let data = try? Data(contentsOf: fileURL),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: String]]
+        else { return [] }
+
+        var groups: [TabGroup] = []
+        for dict in array {
+            guard let folderPath = dict["folder"] else { continue }
+            let folderURL = URL(fileURLWithPath: folderPath)
+            let files = (try? FileManager.default.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil)) ?? []
+            let tabs = files.compactMap { BrowserTab(fromFile: $0, dataStore: WKWebsiteDataStore.nonPersistent()) }
+            if !tabs.isEmpty {
+                let group = TabGroup(name: dict["name"] ?? "Group", tabs: tabs, folderURL: folderURL, dataStore: WKWebsiteDataStore.nonPersistent())
+                groups.append(group)
+            }
+        }
+        return groups
+    }
+}
+
 extension TabGroup {
     static func create(for url: URL? = nil, name: String? = nil) -> TabGroup {
         let domain = url?.host ?? "DefaultGroup"
@@ -147,6 +188,12 @@ extension TabGroup {
         let initialTab = BrowserTab(title: "New Tab", url: url, dataStore: store, groupFolder: baseFolder)
         
         return TabGroup(name: groupName, tabs: [initialTab], folderURL: baseFolder, dataStore: store)
+    }
+    
+    func saveAllTabs() {
+        for tab in tabs {
+            tab.saveTabStateSync()
+        }
     }
 }
 
@@ -196,7 +243,16 @@ struct ContentView: View {
         .background(Color.black)
         .accentColor(.white)
         .sheet(isPresented: $showingSettings) { SettingsView() }
-        .onAppear { loadTabGroups() }
+        .onAppear {
+            let restoredGroups = TabGroupsManager.loadGroups()
+            if !restoredGroups.isEmpty {
+                tabGroups = restoredGroups
+                selectedGroupIndex = 0
+                selectedTabIndex = 0
+            } else {
+                loadTabGroups() // fallback if no saved session
+            }
+        }
     }
 
     // MARK: - Load Tab Groups
@@ -438,6 +494,7 @@ struct ContentView: View {
                 groupFolder: tabGroups[selectedGroupIndex].folderURL
             )
             tabGroups[selectedGroupIndex].tabs.append(newTab)
+            TabGroupsManager.saveGroups(tabGroups)
             selectedTabIndex = tabGroups[selectedGroupIndex].tabs.count - 1
             newTab.persistState()
         }
@@ -451,6 +508,7 @@ struct ContentView: View {
         Task { try? await tab.saveTabState() }
         tab.close()
         tab.deleteTabFile()
+        TabGroupsManager.saveGroups(tabGroups)
 
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             tabGroups[selectedGroupIndex].tabs.remove(at: index)
@@ -472,6 +530,7 @@ struct ContentView: View {
         withAnimation(.spring()) {
             let newGroup = TabGroup.create(name: trimmed)
             tabGroups.append(newGroup)
+            TabGroupsManager.saveGroups(tabGroups)
             selectedGroupIndex = tabGroups.count - 1
             selectedTabIndex = 0
         }
@@ -480,6 +539,7 @@ struct ContentView: View {
     private func removeGroup(at index: Int) {
         withAnimation(.spring()) {
             tabGroups.remove(at: index)
+            TabGroupsManager.saveGroups(tabGroups)
             if selectedGroupIndex >= tabGroups.count {
                 selectedGroupIndex = max(tabGroups.count - 1, 0)
             }
@@ -489,6 +549,7 @@ struct ContentView: View {
     private func clearDataAndCloseTabs() {
         withAnimation(.spring()) {
             tabGroups = [TabGroup.create()]
+            TabGroupsManager.saveGroups(tabGroups)
             selectedGroupIndex = 0
             selectedTabIndex = 0
         }
