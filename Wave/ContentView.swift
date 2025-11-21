@@ -15,11 +15,11 @@ import WebKit
 import Combine
 import UniformTypeIdentifiers
 
-// MARK: - Models
+// MARK: - Browser Tab
 
 final class BrowserTab: NSObject, ObservableObject, Identifiable {
     var id: UUID = UUID()
-    let containerFolder: URL
+    let groupFolder: URL
     
     @Published var title: String
     @Published var url: URL?
@@ -28,11 +28,11 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     
     var webView: WKWebView?
 
-    init(title: String = "New Tab", url: URL? = nil, dataStore: WKWebsiteDataStore, containerFolder: URL) {
+    init(title: String = "New Tab", url: URL? = nil, dataStore: WKWebsiteDataStore, groupFolder: URL) {
         self.title = title
         self.url = url
         self.addressFieldText = url?.absoluteString ?? ""
-        self.containerFolder = containerFolder
+        self.groupFolder = groupFolder
         super.init()
 
         let config = WKWebViewConfiguration()
@@ -64,7 +64,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     }
     
     func deleteTabFile() {
-        let fileURL = containerFolder.appendingPathComponent("\(id.uuidString).json")
+        let fileURL = groupFolder.appendingPathComponent("\(id.uuidString).json")
         try? FileManager.default.removeItem(at: fileURL)
     }
 
@@ -80,7 +80,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
             "url": webView.url?.absoluteString ?? "",
             "title": title
         ]
-        let fileURL = containerFolder.appendingPathComponent("\(self.id.uuidString).json")
+        let fileURL = groupFolder.appendingPathComponent("\(self.id.uuidString).json")
         let data = try JSONSerialization.data(withJSONObject: state)
         try data.write(to: fileURL)
     }
@@ -91,7 +91,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
             "url": webView.url?.absoluteString ?? "",
             "title": title
         ]
-        let fileURL = containerFolder.appendingPathComponent("\(self.id.uuidString).json")
+        let fileURL = groupFolder.appendingPathComponent("\(self.id.uuidString).json")
         if let data = try? JSONSerialization.data(withJSONObject: state) {
             try? data.write(to: fileURL)
         }
@@ -114,12 +114,14 @@ extension BrowserTab {
         let title = dict["title"] as? String ?? "New Tab"
         let url = (dict["url"] as? String).flatMap { URL(string: $0) }
         
-        self.init(title: title, url: url, dataStore: dataStore, containerFolder: fileURL.deletingLastPathComponent())
+        self.init(title: title, url: url, dataStore: dataStore, groupFolder: fileURL.deletingLastPathComponent())
         self.id = id
     }
 }
 
-struct TabContainer: Identifiable {
+// MARK: - Tab Group (per site isolation)
+
+struct TabGroup: Identifiable {
     let id = UUID()
     var name: String
     var tabs: [BrowserTab]
@@ -127,55 +129,52 @@ struct TabContainer: Identifiable {
     var dataStore: WKWebsiteDataStore
 }
 
-extension TabContainer {
-    static func create(name: String) -> TabContainer {
+extension TabGroup {
+    static func create(for url: URL? = nil, name: String? = nil) -> TabGroup {
+        let domain = url?.host ?? "DefaultGroup"
+        let groupName = name ?? domain
         let baseFolder = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("WaveData")
-            .appendingPathComponent("Containers")
+            .appendingPathComponent("TabGroups")
+            .appendingPathComponent(domain)
         
-        let containerFolder = baseFolder.appendingPathComponent(name)
-        let websiteDataStoreSubfolder = containerFolder.appendingPathComponent("Cache")
+        try? FileManager.default.createDirectory(at: baseFolder, withIntermediateDirectories: true)
         
-        try? FileManager.default.createDirectory(at: containerFolder, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: websiteDataStoreSubfolder, withIntermediateDirectories: true)
+        // Each tab group gets a unique data store
+        let store = WKWebsiteDataStore.nonPersistent()
         
-        let storeID = UUID().uuidString
-        let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: storeID) ?? UUID())
+        let initialTab = BrowserTab(title: "New Tab", url: url, dataStore: store, groupFolder: baseFolder)
         
-        let metadata = ContainerMetadata(storeID: storeID)
-        let metadataURL = containerFolder.appendingPathComponent("store.json")
-        if let data = try? JSONEncoder().encode(metadata) {
-            try? data.write(to: metadataURL)
-        }
-        
-        let tab = BrowserTab(title: "New Tab", url: nil, dataStore: store, containerFolder: containerFolder)
-        return TabContainer(name: name, tabs: [tab], folderURL: containerFolder, dataStore: store)
+        return TabGroup(name: groupName, tabs: [initialTab], folderURL: baseFolder, dataStore: store)
     }
 }
 
-struct ContainerMetadata: Codable {
-    let storeID: String
-}
-
-// MARK: - Main View
+// MARK: - Content View
 
 struct ContentView: View {
-    @State private var containers: [TabContainer] = []
-    @State private var selectedContainerIndex: Int = 0
+    @State private var tabGroups: [TabGroup] = []
+    @State private var selectedGroupIndex: Int = 0
     @State private var selectedTabIndex: Int = 0
     @State private var showingTabOverview = false
     @State private var showingSettings = false
-    @State private var showingNewContainerPopover = false
-    @State private var newContainerName = ""
+    @State private var showingNewGroupPopover = false
+    @State private var newGroupName = ""
     @State private var searchQuery: String = ""
-    
+
     @Namespace private var tabNamespace
-    
+
     private let MAX_TAB_WIDTH: CGFloat = 180
     private let MIN_TAB_WIDTH: CGFloat = 80
     private let TAB_SPACING: CGFloat = 6
-    
+
+    // MARK: - Safe Current Tab
+    private var currentTab: BrowserTab? {
+        guard tabGroups.indices.contains(selectedGroupIndex),
+              tabGroups[selectedGroupIndex].tabs.indices.contains(selectedTabIndex) else { return nil }
+        return tabGroups[selectedGroupIndex].tabs[selectedTabIndex]
+    }
+
     var body: some View {
         ZStack {
             if !showingTabOverview {
@@ -184,8 +183,10 @@ struct ContentView: View {
                     Divider().background(Color.gray.opacity(0.4))
                     tabsBar
                     Divider().background(Color.gray.opacity(0.4))
-                    WebViewContainer(tab: containers[selectedContainerIndex].tabs[selectedTabIndex])
-                        .id(containers[selectedContainerIndex].tabs[selectedTabIndex].id)
+                    if let tab = currentTab {
+                        WebViewContainer(tab: tab)
+                            .id(tab.id)
+                    }
                 }
                 .transition(.move(edge: .bottom))
             } else {
@@ -194,135 +195,68 @@ struct ContentView: View {
         }
         .background(Color.black)
         .accentColor(.white)
-        .sheet(isPresented: $showingSettings) {
-            SettingsView()
+        .sheet(isPresented: $showingSettings) { SettingsView() }
+        .onAppear { loadTabGroups() }
+    }
+
+    // MARK: - Load Tab Groups
+    private func loadTabGroups() {
+        // Ensure at least one TabGroup exists
+        if tabGroups.isEmpty {
+            let defaultGroup = TabGroup.create(name: "Tabs")
+            tabGroups = [defaultGroup]
+            selectedGroupIndex = 0
+            selectedTabIndex = 0
+        }
+
+        // Ensure the "tabs" group exists
+        if !tabGroups.contains(where: { $0.name == "Tabs" }) {
+            let newTabsGroup = TabGroup.create(name: "Tabs")
+            tabGroups.insert(newTabsGroup, at: 0)
+            selectedGroupIndex = 0
+            selectedTabIndex = 0
+        }
+
+        // Ensure the selected group's tabs array is not empty
+        if tabGroups[selectedGroupIndex].tabs.isEmpty {
+            let newTab = BrowserTab(
+                title: "New Tab",
+                url: nil,
+                dataStore: tabGroups[selectedGroupIndex].dataStore,
+                groupFolder: tabGroups[selectedGroupIndex].folderURL
+            )
+            tabGroups[selectedGroupIndex].tabs = [newTab]
+            selectedTabIndex = 0
         }
     }
-    
-    // MARK: Load Containers
-    
-    init() {
-        let loaded = Self.loadContainers()
-        
-        if loaded.isEmpty {
-            // No saved containers: create a default one
-            _containers = State(initialValue: [TabContainer.create(name: "Tabs")])
-            _selectedContainerIndex = State(initialValue: 0)
-            _selectedTabIndex = State(initialValue: 0)
-        } else {
-            // Fix containers that have zero tabs
-            let fixedContainers = loaded.map { container -> TabContainer in
-                var c = container
-                if c.tabs.isEmpty {
-                    let tab = BrowserTab(
-                        title: "New Tab",
-                        url: nil,
-                        dataStore: c.dataStore,
-                        containerFolder: c.folderURL
-                    )
-                    c.tabs = [tab]
-                }
-                return c
-            }
-            _containers = State(initialValue: fixedContainers)
-            _selectedContainerIndex = State(initialValue: 0)
-            // Ensure selectedTabIndex is valid
-            _selectedTabIndex = State(initialValue: fixedContainers[0].tabs.isEmpty ? 0 : 0)
-        }
-    }
-    
-    func saveAllTabsSync() {
-        for container in containers {
-            let folder = container.folderURL
-            let existingFiles = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
-            let currentTabIDs = Set(container.tabs.map { $0.id.uuidString + ".json" })
-            
-            for file in existingFiles where file.hasSuffix(".json") && !currentTabIDs.contains(file) {
-                try? FileManager.default.removeItem(at: folder.appendingPathComponent(file))
-            }
-            
-            for tab in container.tabs {
-                tab.saveTabStateSync()
-            }
-        }
-    }
-    
-    static func loadContainers() -> [TabContainer] {
-        let baseFolder = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("WaveData")
-            .appendingPathComponent("Containers")
-        
-        guard let folderNames = try? FileManager.default.contentsOfDirectory(atPath: baseFolder.path) else { return [] }
-        
-        return folderNames.compactMap { name in
-            let containerFolder = baseFolder.appendingPathComponent(name)
-            
-            let metadataURL = containerFolder.appendingPathComponent("store.json")
-            var storeID: String
-            if let data = try? Data(contentsOf: metadataURL),
-               let metadata = try? JSONDecoder().decode(ContainerMetadata.self, from: data) {
-                storeID = metadata.storeID
-            } else {
-                storeID = UUID().uuidString
-            }
-            
-            let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: storeID) ?? UUID())
-            
-            let tabFiles = (try? FileManager.default.contentsOfDirectory(atPath: containerFolder.path))?.filter { $0.hasSuffix(".json") } ?? []
-            let tabs = tabFiles.compactMap { fileName -> BrowserTab? in
-                let fileURL = containerFolder.appendingPathComponent(fileName)
-                return BrowserTab(fromFile: fileURL, dataStore: store)
-            }
-            
-            let validIDs = Set(tabs.map { $0.id.uuidString + ".json" })
-            for file in tabFiles where !validIDs.contains(file) {
-                let fileURL = containerFolder.appendingPathComponent(file)
-                try? FileManager.default.removeItem(at: fileURL)
-            }
-            
-            return TabContainer(name: name, tabs: tabs, folderURL: containerFolder, dataStore: store)
-        }
-    }
-    
-    // MARK: Top Bar
+
+    // MARK: - Top Bar
     private var topBar: some View {
         HStack(spacing: 10) {
-            Button(action: goBack) {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 15))
-            }
-            Button(action: goForward) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 15))
-            }
-            
+            Button(action: goBack) { Image(systemName: "chevron.left").font(.system(size: 15)) }
+            Button(action: goForward) { Image(systemName: "chevron.right").font(.system(size: 15)) }
+
             HStack(spacing: 6) {
-                Button(action: reload) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 15))
+                Button(action: reload) { Image(systemName: "arrow.clockwise").font(.system(size: 15)) }
+                if let tab = currentTab {
+                    WebAddressField(tab: tab)
+                        .id(tab.id)
+                        .frame(width: 300)
                 }
-                WebAddressField(tab: containers[selectedContainerIndex].tabs[selectedTabIndex])
-                    .id(containers[selectedContainerIndex].tabs[selectedTabIndex].id)
-                    .frame(width: 300)
                 Button(action: {}) {
-                    Image(systemName: "shield.lefthalf.fill")
-                        .font(.system(size: 16))
-                        .foregroundColor(.green)
+                    Image(systemName: "shield.lefthalf.fill").font(.system(size: 16)).foregroundColor(.green)
                 }
-            }
-            .frame(maxWidth: .infinity)
-            
+            }.frame(maxWidth: .infinity)
+
             Button(action: { withAnimation(.spring()){ showingTabOverview.toggle() } }) {
-                Image(systemName: "square.grid.2x2")
-                    .font(.system(size: 18))
+                Image(systemName: "square.grid.2x2").font(.system(size: 18))
             }
-            
+
             Menu {
                 Button("History") {}
                 Button("Bookmarks") {}
                 Button("Downloads") {}
-                Button("Clear data & close tabs", role: .destructive) { clearDataAndCloseTabs() }
+                Button("Clear data & close tabs") { }
                 Divider()
                 Button("Settings") { showingSettings.toggle() }
             } label: {
@@ -341,42 +275,38 @@ struct ContentView: View {
         .buttonStyle(PlainButtonStyle())
         .foregroundColor(.white)
     }
-    
-    // MARK: Tabs Bar
+
+    // MARK: - Tabs Bar
     private var tabsBar: some View {
         GeometryReader { geometry in
             HStack(spacing: TAB_SPACING) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: TAB_SPACING) {
+                        if tabGroups.indices.contains(selectedGroupIndex) {
+                            let tabs = tabGroups[selectedGroupIndex].tabs
+                            let tabCount = CGFloat(tabs.count)
+                            let plusButtonWidth: CGFloat = 20
+                            let totalFixedSpace: CGFloat = 32 + plusButtonWidth + TAB_SPACING
+                            let availableWidthForTabs = geometry.size.width - totalFixedSpace
+                            let totalSpacingBetweenTabs = tabCount > 0 ? (tabCount - 1) * TAB_SPACING : 0
+                            let idealWidth = tabCount > 0 ? (availableWidthForTabs - totalSpacingBetweenTabs) / tabCount : MAX_TAB_WIDTH
+                            let tabWidth: CGFloat = min(MAX_TAB_WIDTH, max(MIN_TAB_WIDTH, idealWidth))
 
-                        let tabCount = CGFloat(containers[selectedContainerIndex].tabs.count)
-                        let plusButtonWidth: CGFloat = 20
-                        let totalFixedSpace: CGFloat = 32 + plusButtonWidth + TAB_SPACING
-                        let availableWidthForTabs = geometry.size.width - totalFixedSpace
-                        let totalSpacingBetweenTabs = tabCount > 0 ? (tabCount - 1) * TAB_SPACING : 0
-                        let idealWidth = tabCount > 0 ? (availableWidthForTabs - totalSpacingBetweenTabs) / tabCount : MAX_TAB_WIDTH
-                        let tabWidth: CGFloat = min(MAX_TAB_WIDTH, max(MIN_TAB_WIDTH, idealWidth))
-                        
-                        ForEach(Array(containers[selectedContainerIndex].tabs.enumerated()), id: \.element.id) { offset, tab in
-                            TabButton(
-                                tab: tab,
-                                isSelected: offset == selectedTabIndex,
-                                namespace: tabNamespace,
-                                closeAction: { closeTab(at: offset) }
-                            ) {
-                                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                                    selectedTabIndex = offset
+                            ForEach(Array(tabs.enumerated()), id: \.element.id) { offset, tab in
+                                TabButton(tab: tab,
+                                          isSelected: offset == selectedTabIndex,
+                                          namespace: tabNamespace,
+                                          closeAction: { closeTab(at: offset) }) {
+                                    withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                                        selectedTabIndex = offset
+                                    }
                                 }
+                                .frame(width: tabWidth)
                             }
-                            // Apply the calculated dynamic width
-                            .frame(width: tabWidth)
+
+                            Button(action: addTab) { Image(systemName: "plus").font(.system(size: 16)) }
+                                .frame(width: plusButtonWidth)
                         }
-                        
-                        Button(action: addTab) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 16))
-                        }
-                        .frame(width: plusButtonWidth)
                     }
                     .frame(minWidth: geometry.size.width - 32 - TAB_SPACING, alignment: .leading)
                 }
@@ -386,66 +316,45 @@ struct ContentView: View {
             .background(Color.black)
             .buttonStyle(PlainButtonStyle())
             .foregroundColor(.white)
-            .animation(.spring(response: 0.4, dampingFraction: 0.8), value: containers[selectedContainerIndex].tabs.count)
+            .animation(.spring(response: 0.4, dampingFraction: 0.8), value: tabGroups.indices.contains(selectedGroupIndex) ? tabGroups[selectedGroupIndex].tabs.count : 0)
         }
-        .frame(height: 40) // Give the GeometryReader a fixed height, matching the bar's height
+        .frame(height: 40)
     }
-    
-    // MARK: Tab Overview
+
+    // MARK: - Tab Overview
     private var tabOverview: some View {
         VStack(spacing: 0) {
             HStack {
                 Spacer()
-                TextField("Search \(containers[selectedContainerIndex].name)...", text: $searchQuery)
+                TextField("Search \(tabGroups[selectedGroupIndex].name)...", text: $searchQuery)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                     .frame(width: 300)
                 Spacer()
-            }
-            .padding(.top)
-            
+            }.padding(.top)
+
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 20)], spacing: 20) {
                     ForEach(filteredTabs.indices, id: \.self) { index in
                         ZStack(alignment: .topTrailing) {
                             VStack(spacing: 6) {
                                 if let image = filteredTabs[index].preview {
-                                    Image(uiImage: image)
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(height: 120)
-                                        .clipped()
-                                        .cornerRadius(8)
+                                    Image(uiImage: image).resizable().scaledToFill().frame(height: 120).clipped().cornerRadius(8)
                                 } else {
-                                    Rectangle()
-                                        .fill(Color.gray.opacity(0.3))
-                                        .frame(height: 120)
-                                        .cornerRadius(8)
+                                    Rectangle().fill(Color.gray.opacity(0.3)).frame(height: 120).cornerRadius(8)
                                         .overlay(Text("Loading...").foregroundColor(.white.opacity(0.7)))
                                 }
-                                Text(filteredTabs[index].title)
-                                    .font(.headline)
-                                    .foregroundColor(.white)
-                                    .lineLimit(1)
-                                    .multilineTextAlignment(.center)
-                                    .frame(maxWidth: .infinity)
+                                Text(filteredTabs[index].title).font(.headline).foregroundColor(.white).lineLimit(1).multilineTextAlignment(.center)
                             }
-                            
                             Button(action: {
-                                if let actualIndex = containers[selectedContainerIndex].tabs.firstIndex(where: { $0.id == filteredTabs[index].id }) {
+                                if let actualIndex = tabGroups[selectedGroupIndex].tabs.firstIndex(where: { $0.id == filteredTabs[index].id }) {
                                     closeTab(at: actualIndex)
                                 }
                             }) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundColor(.white)
-                                    .background(Color.black.opacity(0.6))
-                                    .clipShape(Circle())
-                                    .font(.system(size: 14))
-                            }
-                            .buttonStyle(PlainButtonStyle())
-                            .padding(4)
+                                Image(systemName: "xmark.circle.fill").foregroundColor(.white).background(Color.black.opacity(0.6)).clipShape(Circle()).font(.system(size: 14))
+                            }.buttonStyle(PlainButtonStyle()).padding(4)
                         }
                         .onTapGesture {
-                            if let actualIndex = containers[selectedContainerIndex].tabs.firstIndex(where: { $0.id == filteredTabs[index].id }) {
+                            if let actualIndex = tabGroups[selectedGroupIndex].tabs.firstIndex(where: { $0.id == filteredTabs[index].id }) {
                                 withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
                                     selectedTabIndex = actualIndex
                                     showingTabOverview.toggle()
@@ -453,58 +362,41 @@ struct ContentView: View {
                             }
                         }
                     }
-                }
-                .padding()
+                }.padding()
             }
-            
+
             Divider().background(Color.gray.opacity(0.4))
-            
+
             HStack(spacing: 6) {
-                ForEach(containers.indices, id: \.self) { i in
+                ForEach(tabGroups.indices, id: \.self) { i in
                     HStack(spacing: 4) {
-                        Text(containers[i].name)
-                            .font(.system(size: 14, weight: i == selectedContainerIndex ? .bold : .regular))
-                            .foregroundColor(i == selectedContainerIndex ? .white : .gray)
-                            .onTapGesture {
-                                withAnimation(.spring()) { selectedContainerIndex = i }
-                            }
-                        if containers.count > 1 {
-                            Button(action: {
-                                removeContainer(at: i)
-                            }) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundColor(.white)
-                                    .font(.system(size: 12))
-                            }
-                            .buttonStyle(PlainButtonStyle())
+                        Text(tabGroups[i].name)
+                            .font(.system(size: 14, weight: i == selectedGroupIndex ? .bold : .regular))
+                            .foregroundColor(i == selectedGroupIndex ? .white : .gray)
+                            .onTapGesture { withAnimation(.spring()) { selectedGroupIndex = i } }
+                        if tabGroups.count > 1 {
+                            Button(action: { removeGroup(at: i) }) {
+                                Image(systemName: "xmark.circle.fill").foregroundColor(.white).font(.system(size: 12))
+                            }.buttonStyle(PlainButtonStyle())
                         }
                     }
                 }
-                Button(action: { showingNewContainerPopover = true }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 16))
-                }
-                .popover(isPresented: $showingNewContainerPopover) {
+                Button(action: { showingNewGroupPopover = true }) {
+                    Image(systemName: "plus").font(.system(size: 16))
+                }.popover(isPresented: $showingNewGroupPopover) {
                     VStack(spacing: 12) {
-                        Text("New Container")
-                            .font(.headline)
-                            .padding(.top)
-                        TextField("Container Name", text: $newContainerName)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                            .padding(.horizontal)
+                        Text("New Tab Group").font(.headline).padding(.top)
+                        TextField("Group Name", text: $newGroupName).textFieldStyle(RoundedBorderTextFieldStyle()).padding(.horizontal)
                         HStack {
-                            Button("Cancel") { showingNewContainerPopover = false }
+                            Button("Cancel") { showingNewGroupPopover = false }
                             Spacer()
                             Button("Create") {
-                                addContainer(named: newContainerName)
-                                showingNewContainerPopover = false
-                                newContainerName = ""
-                            }
-                            .disabled(newContainerName.trimmingCharacters(in: .whitespaces).isEmpty)
-                        }
-                        .padding()
-                    }
-                    .frame(width: 250)
+                                addGroup(named: newGroupName)
+                                showingNewGroupPopover = false
+                                newGroupName = ""
+                            }.disabled(newGroupName.trimmingCharacters(in: .whitespaces).isEmpty)
+                        }.padding()
+                    }.frame(width: 250)
                     #if os(macOS)
                     .background(Color(NSColor.windowBackgroundColor))
                     #elseif os(iOS)
@@ -512,118 +404,99 @@ struct ContentView: View {
                     #endif
                 }
                 Spacer()
-                Button(action: { withAnimation(.spring()){ showingTabOverview.toggle() } }) {
-                    Image(systemName: "square.grid.2x2")
-                        .font(.system(size: 18))
-                }
+                Button(action: { withAnimation(.spring()){ showingTabOverview.toggle() } }) { Image(systemName: "square.grid.2x2").font(.system(size: 18)) }
             }
             .padding()
             #if os(macOS)
             .buttonStyle(PlainButtonStyle())
             #elseif os(iOS)
-            .buttonStyle(.plain) // iOS 15+ shorthand
+            .buttonStyle(.plain)
             #endif
             .foregroundColor(.white)
         }
         .background(Color.black.edgesIgnoringSafeArea(.all))
     }
-    
+
     // MARK: Filtered Tabs
     private var filteredTabs: [BrowserTab] {
-        let allTabs = containers[selectedContainerIndex].tabs
+        let allTabs = tabGroups[selectedGroupIndex].tabs
         if searchQuery.isEmpty { return allTabs }
         return allTabs.filter { $0.title.localizedCaseInsensitiveContains(searchQuery) }
     }
-    
-    // MARK: Actions
-    private var currentWebView: WKWebView? {
-        containers[selectedContainerIndex].tabs[selectedTabIndex].webView
-    }
 
-    private func goBack() { currentWebView?.goBack() }
-    private func goForward() { currentWebView?.goForward() }
-    private func reload() { currentWebView?.reload() }
-    
+    // MARK: Actions
+    private func goBack() { currentTab?.webView?.goBack() }
+    private func goForward() { currentTab?.webView?.goForward() }
+    private func reload() { currentTab?.webView?.reload() }
+
     private func addTab() {
         withAnimation(.spring()) {
-            let container = containers[selectedContainerIndex]
             let newTab = BrowserTab(
                 title: "New Tab",
                 url: nil,
-                dataStore: container.dataStore,
-                containerFolder: container.folderURL
+                dataStore: currentTab?.webView?.configuration.websiteDataStore ?? WKWebsiteDataStore.nonPersistent(),
+                groupFolder: tabGroups[selectedGroupIndex].folderURL
             )
-            containers[selectedContainerIndex].tabs.append(newTab)
-            selectedTabIndex = containers[selectedContainerIndex].tabs.count - 1
+            tabGroups[selectedGroupIndex].tabs.append(newTab)
+            selectedTabIndex = tabGroups[selectedGroupIndex].tabs.count - 1
             newTab.persistState()
         }
     }
-    
-    private func closeTab(at index: Int) {
-        guard containers.indices.contains(selectedContainerIndex),
-              containers[selectedContainerIndex].tabs.indices.contains(index) else { return }
 
-        let tab = containers[selectedContainerIndex].tabs[index]
-        Task {
-            try? await tab.saveTabState()
-        }
+    private func closeTab(at index: Int) {
+        guard tabGroups.indices.contains(selectedGroupIndex),
+              tabGroups[selectedGroupIndex].tabs.indices.contains(index) else { return }
+
+        let tab = tabGroups[selectedGroupIndex].tabs[index]
+        Task { try? await tab.saveTabState() }
         tab.close()
         tab.deleteTabFile()
 
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-            containers[selectedContainerIndex].tabs.remove(at: index)
-
-            // Ensure there's always at least one tab
-            if containers[selectedContainerIndex].tabs.isEmpty {
-                let container = containers[selectedContainerIndex]
-                let newTab = BrowserTab(title: "New Tab", url: nil, dataStore: container.dataStore, containerFolder: container.folderURL)
-                containers[selectedContainerIndex].tabs.append(newTab)
-                selectedTabIndex = 0
-                newTab.persistState()
-            } else if selectedTabIndex >= containers[selectedContainerIndex].tabs.count {
-                // If we closed the last tab, move selection to the previous tab
-                selectedTabIndex = containers[selectedContainerIndex].tabs.count - 1
+            tabGroups[selectedGroupIndex].tabs.remove(at: index)
+            if tabGroups[selectedGroupIndex].tabs.isEmpty {
+                addTab()
+            } else if selectedTabIndex >= tabGroups[selectedGroupIndex].tabs.count {
+                selectedTabIndex = tabGroups[selectedGroupIndex].tabs.count - 1
             } else if selectedTabIndex > index {
-                // If a tab before the selected tab was removed, adjust the index
                 selectedTabIndex -= 1
             } else if selectedTabIndex == index {
-                // If we closed the currently selected tab, select the previous one if possible
                 selectedTabIndex = max(0, index - 1)
             }
         }
     }
-    
-    private func addContainer(named name: String) {
+
+    private func addGroup(named name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        
         withAnimation(.spring()) {
-            let newContainer = TabContainer.create(name: trimmed)
-            containers.append(newContainer)
-            selectedContainerIndex = containers.count - 1
+            let newGroup = TabGroup.create(name: trimmed)
+            tabGroups.append(newGroup)
+            selectedGroupIndex = tabGroups.count - 1
+            selectedTabIndex = 0
         }
     }
-    
-    private func removeContainer(at index: Int) {
+
+    private func removeGroup(at index: Int) {
         withAnimation(.spring()) {
-            containers.remove(at: index)
-            if selectedContainerIndex >= containers.count {
-                selectedContainerIndex = containers.count - 1
+            tabGroups.remove(at: index)
+            if selectedGroupIndex >= tabGroups.count {
+                selectedGroupIndex = max(tabGroups.count - 1, 0)
             }
         }
     }
-    
+
     private func clearDataAndCloseTabs() {
         withAnimation(.spring()) {
-            let newContainer = TabContainer.create(name: "Tabs")
-            containers = [newContainer]
-            selectedContainerIndex = 0
+            tabGroups = [TabGroup.create()]
+            selectedGroupIndex = 0
             selectedTabIndex = 0
         }
     }
 }
 
-// MARK: - WebView
+
+// MARK: - WebViewContainer
 
 struct WebViewContainer: PlatformViewRepresentable {
     @ObservedObject var tab: BrowserTab
@@ -636,7 +509,6 @@ struct WebViewContainer: PlatformViewRepresentable {
         webView.navigationDelegate = context.coordinator
         return webView
     }
-
     func updateNSView(_ nsView: WKWebView, context: Context) {}
     #elseif os(iOS)
     func makeUIView(context: Context) -> WKWebView {
@@ -650,7 +522,6 @@ struct WebViewContainer: PlatformViewRepresentable {
         webView.navigationDelegate = context.coordinator
         return webView
     }
-
     func updateUIView(_ uiView: WKWebView, context: Context) {}
     #endif
 
@@ -674,9 +545,7 @@ struct WebViewContainer: PlatformViewRepresentable {
                     self.tab.preview = NSImage(cgImage: cgImage, size: NSSize(width: 400, height: 300))
                 }
                 #elseif os(iOS)
-                if let image = image {
-                    self.tab.preview = image
-                }
+                if let image = image { self.tab.preview = image }
                 #endif
             }
         }
@@ -703,33 +572,16 @@ struct TabButton: View {
                 }
 
                 HStack {
-                    Color.clear
-                        .frame(width: 20)
-
+                    Color.clear.frame(width: 20)
                     Spacer()
-
-                    Text(tab.title)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white)
-                        .minimumScaleFactor(0.6)
-                        .lineLimit(1)
-
+                    Text(tab.title).font(.system(size: 13, weight: .medium)).foregroundColor(.white).minimumScaleFactor(0.6).lineLimit(1)
                     Spacer()
-
-                    // Right close button
                     Button(action: closeAction) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white.opacity(0.8))
-                    }
-                    .frame(width: 20)
-                    .buttonStyle(PlainButtonStyle())
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundColor(.white.opacity(0.8))
+                    }.frame(width: 20).buttonStyle(PlainButtonStyle())
+                }.padding(.horizontal, 8).padding(.vertical, 4)
             }
-        }
-        .buttonStyle(PlainButtonStyle())
+        }.buttonStyle(PlainButtonStyle())
     }
 }
 
@@ -753,31 +605,21 @@ struct WebAddressField: View {
         .background(
             RoundedRectangle(cornerRadius: 6)
                 #if os(macOS)
-                .fill(Color(NSColor.windowBackgroundColor)) // dynamic with system appearance
+                .fill(Color(NSColor.windowBackgroundColor))
                 #elseif os(iOS)
                 .fill(Color(UIColor.black))
                 #endif
         )
         .foregroundColor(.primary)
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(Color.gray.opacity(0.5), lineWidth: 1)
-        )
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.5), lineWidth: 1))
     }
 
     private func commit() {
         let raw = tab.addressFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        guard !raw.isEmpty else {
-            tab.addressFieldText = tab.url?.absoluteString ?? ""
-            return
-        }
+        guard !raw.isEmpty else { tab.addressFieldText = tab.url?.absoluteString ?? ""; return }
 
         var urlString = raw
-        if !urlString.hasPrefix("http://") && !urlString.hasPrefix("https://") {
-            urlString = "https://\(urlString)"
-        }
-
+        if !urlString.hasPrefix("http://") && !urlString.hasPrefix("https://") { urlString = "https://\(urlString)" }
         guard let url = URL(string: urlString), url.host != nil else { return }
 
         if tab.url != url {
@@ -787,14 +629,12 @@ struct WebAddressField: View {
     }
 }
 
-// MARK: - Settings View
+// MARK: - Settings
 
 struct SettingsView: View {
     var body: some View {
         VStack {
-            Text("Settings")
-                .font(.largeTitle)
-                .padding()
+            Text("Settings").font(.largeTitle).padding()
             Spacer()
         }
         .frame(minWidth: 400, minHeight: 300)
