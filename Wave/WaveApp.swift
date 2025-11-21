@@ -7,9 +7,11 @@ struct WaveApp: App {
     var body: some Scene {
         WindowGroup {
             contentView
+                #if os(macOS)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     contentView.saveAllTabsSync()
                 }
+                #endif
         }
     }
 }

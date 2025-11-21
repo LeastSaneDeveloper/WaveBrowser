@@ -1,4 +1,16 @@
+#if os(macOS)
+import AppKit
 import SwiftUI
+typealias PlatformImage = NSImage
+typealias PlatformViewRepresentable = NSViewRepresentable
+typealias PlatformColor = NSColor
+#elseif os(iOS)
+import UIKit
+import SwiftUI
+typealias PlatformImage = UIImage
+typealias PlatformViewRepresentable = UIViewRepresentable
+typealias PlatformColor = UIColor
+#endif
 import WebKit
 import Combine
 import UniformTypeIdentifiers
@@ -6,13 +18,13 @@ import UniformTypeIdentifiers
 // MARK: - Models
 
 final class BrowserTab: NSObject, ObservableObject, Identifiable {
-    let id = UUID()
+    var id: UUID = UUID()
     let containerFolder: URL
     
     @Published var title: String
     @Published var url: URL?
     @Published var addressFieldText: String = ""
-    @Published var preview: NSImage?
+    @Published var preview: PlatformImage?
     
     var webView: WKWebView?
 
@@ -28,8 +40,6 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         config.websiteDataStore = dataStore
         
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
-        webView.addObserver(self, forKeyPath: "title", options: .new, context: nil)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
         self.webView = webView
 
@@ -43,37 +53,19 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         self.addressFieldText = url.absoluteString
         webView?.load(URLRequest(url: url))
     }
-
-    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-        if keyPath == "URL", let webView = object as? WKWebView {
-            DispatchQueue.main.async {
-                self.url = webView.url
-                self.addressFieldText = webView.url?.absoluteString ?? ""
-                self.persistState()
-            }
-        } else if keyPath == "title", let webView = object as? WKWebView {
-            DispatchQueue.main.async {
-                if let newTitle = webView.title, !newTitle.isEmpty {
-                    self.title = newTitle
-                    self.persistState()
-                }
-            }
-        }
-    }
     
     func close() {
         guard let webView = webView else { return }
-
-        // Stop everything and load blank page
         webView.stopLoading()
-        webView.load(URLRequest(url: URL(string: "about:blank")!))
-
-        // Clear delegates
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
-        
         webView.removeFromSuperview()
         self.webView = nil
+    }
+    
+    func deleteTabFile() {
+        let fileURL = containerFolder.appendingPathComponent("\(id.uuidString).json")
+        try? FileManager.default.removeItem(at: fileURL)
     }
 
     deinit {
@@ -112,6 +104,21 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     }
 }
 
+extension BrowserTab {
+    convenience init?(fromFile fileURL: URL, dataStore: WKWebsiteDataStore) {
+        guard let data = try? Data(contentsOf: fileURL),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        
+        let id = UUID(uuidString: fileURL.deletingPathExtension().lastPathComponent) ?? UUID()
+        let title = dict["title"] as? String ?? "New Tab"
+        let url = (dict["url"] as? String).flatMap { URL(string: $0) }
+        
+        self.init(title: title, url: url, dataStore: dataStore, containerFolder: fileURL.deletingLastPathComponent())
+        self.id = id
+    }
+}
+
 struct TabContainer: Identifiable {
     let id = UUID()
     var name: String
@@ -126,60 +133,29 @@ extension TabContainer {
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("WaveData")
             .appendingPathComponent("Containers")
-            
-        let containerFolder = baseFolder.appendingPathComponent(name)
         
+        let containerFolder = baseFolder.appendingPathComponent(name)
         let websiteDataStoreSubfolder = containerFolder.appendingPathComponent("Cache")
         
         try? FileManager.default.createDirectory(at: containerFolder, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: websiteDataStoreSubfolder, withIntermediateDirectories: true)
         
-        let storeID = UUID(uuidString: name) ?? UUID()
-        let store = WKWebsiteDataStore(forIdentifier: storeID)
-
+        let storeID = UUID().uuidString
+        let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: storeID) ?? UUID())
+        
+        let metadata = ContainerMetadata(storeID: storeID)
+        let metadataURL = containerFolder.appendingPathComponent("store.json")
+        if let data = try? JSONEncoder().encode(metadata) {
+            try? data.write(to: metadataURL)
+        }
+        
         let tab = BrowserTab(title: "New Tab", url: nil, dataStore: store, containerFolder: containerFolder)
         return TabContainer(name: name, tabs: [tab], folderURL: containerFolder, dataStore: store)
     }
 }
 
-struct TabReorderDelegate: DropDelegate {
-    @Binding var containers: [TabContainer]
-    let containerIndex: Int
-    let current: BrowserTab
-    let currentIndex: Int
-    @Binding var selectedTabIndex: Int
-    
-    func performDrop(info: DropInfo) -> Bool { true }
-    
-    func dropEntered(info: DropInfo) {
-        guard
-            let item = info.itemProviders(for: [UTType.plainText]).first
-        else { return }
-
-        item.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { data, _ in
-            guard
-                let d = data as? Data,
-                let str = String(data: d, encoding: .utf8),
-                let draggedID = UUID(uuidString: str),
-                let fromIndex = containers[containerIndex].tabs.firstIndex(where: { $0.id == draggedID }),
-                fromIndex != currentIndex
-            else { return }
-
-            DispatchQueue.main.async {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                    let tab = containers[containerIndex].tabs.remove(at: fromIndex)
-                    containers[containerIndex].tabs.insert(tab, at: currentIndex)
-
-                    if selectedTabIndex == fromIndex { selectedTabIndex = currentIndex }
-                    else if selectedTabIndex >= min(fromIndex, currentIndex)
-                            && selectedTabIndex <= max(fromIndex, currentIndex) {
-                        if fromIndex < currentIndex { selectedTabIndex -= 1 }
-                        else { selectedTabIndex += 1 }
-                    }
-                }
-            }
-        }
-    }
+struct ContainerMetadata: Codable {
+    let storeID: String
 }
 
 // MARK: - Main View
@@ -273,32 +249,36 @@ struct ContentView: View {
     
     static func loadContainers() -> [TabContainer] {
         let baseFolder = FileManager.default
-                    .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("WaveData")
-                    .appendingPathComponent("Containers")
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("WaveData")
+            .appendingPathComponent("Containers")
         
         guard let folderNames = try? FileManager.default.contentsOfDirectory(atPath: baseFolder.path) else { return [] }
         
         return folderNames.compactMap { name in
             let containerFolder = baseFolder.appendingPathComponent(name)
             
-            let storeID = UUID(uuidString: name) ?? UUID()
-            let store = WKWebsiteDataStore(forIdentifier: storeID)
+            let metadataURL = containerFolder.appendingPathComponent("store.json")
+            var storeID: String
+            if let data = try? Data(contentsOf: metadataURL),
+               let metadata = try? JSONDecoder().decode(ContainerMetadata.self, from: data) {
+                storeID = metadata.storeID
+            } else {
+                storeID = UUID().uuidString
+            }
+            
+            let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: storeID) ?? UUID())
             
             let tabFiles = (try? FileManager.default.contentsOfDirectory(atPath: containerFolder.path))?.filter { $0.hasSuffix(".json") } ?? []
-            
             let tabs = tabFiles.compactMap { fileName -> BrowserTab? in
                 let fileURL = containerFolder.appendingPathComponent(fileName)
-                guard
-                    let data = try? Data(contentsOf: fileURL),
-                    let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let urlString = dict["url"] as? String
-                else { return nil }
-                    
-                let url = URL(string: urlString)
-                let title = dict["title"] as? String ?? "New Tab"
-                    
-                return BrowserTab(title: title, url: url, dataStore: store, containerFolder: containerFolder)
+                return BrowserTab(fromFile: fileURL, dataStore: store)
+            }
+            
+            let validIDs = Set(tabs.map { $0.id.uuidString + ".json" })
+            for file in tabFiles where !validIDs.contains(file) {
+                let fileURL = containerFolder.appendingPathComponent(file)
+                try? FileManager.default.removeItem(at: fileURL)
             }
             
             return TabContainer(name: name, tabs: tabs, folderURL: containerFolder, dataStore: store)
@@ -346,7 +326,11 @@ struct ContentView: View {
                 Divider()
                 Button("Settings") { showingSettings.toggle() }
             } label: {
+                #if os(macOS)
                 EmptyView()
+                #elseif os(iOS)
+                Image(systemName: "line.horizontal.3")
+                #endif
             }
             .menuStyle(BorderlessButtonMenuStyle())
             .fixedSize()
@@ -386,31 +370,6 @@ struct ContentView: View {
                             }
                             // Apply the calculated dynamic width
                             .frame(width: tabWidth)
-                            .onDrag {
-                                let provider = NSItemProvider()
-                                let idString = tab.id.uuidString
-
-                                provider.registerDataRepresentation(
-                                    forTypeIdentifier: UTType.plainText.identifier,
-                                    visibility: .all
-                                ) { completion in
-                                    Task { @MainActor in
-                                        completion(idString.data(using: .utf8), nil)
-                                    }
-                                    return nil
-                                }
-                                return provider
-                            }
-                            .onDrop(
-                                of: [.text],
-                                delegate: TabReorderDelegate(
-                                    containers: $containers,
-                                    containerIndex: selectedContainerIndex,
-                                    current: tab,
-                                    currentIndex: offset,
-                                    selectedTabIndex: $selectedTabIndex
-                                )
-                            )
                         }
                         
                         Button(action: addTab) {
@@ -450,7 +409,7 @@ struct ContentView: View {
                         ZStack(alignment: .topTrailing) {
                             VStack(spacing: 6) {
                                 if let image = filteredTabs[index].preview {
-                                    Image(nsImage: image)
+                                    Image(uiImage: image)
                                         .resizable()
                                         .scaledToFill()
                                         .frame(height: 120)
@@ -546,7 +505,11 @@ struct ContentView: View {
                         .padding()
                     }
                     .frame(width: 250)
+                    #if os(macOS)
                     .background(Color(NSColor.windowBackgroundColor))
+                    #elseif os(iOS)
+                    .background(Color(UIColor.systemBackground))
+                    #endif
                 }
                 Spacer()
                 Button(action: { withAnimation(.spring()){ showingTabOverview.toggle() } }) {
@@ -555,7 +518,11 @@ struct ContentView: View {
                 }
             }
             .padding()
+            #if os(macOS)
             .buttonStyle(PlainButtonStyle())
+            #elseif os(iOS)
+            .buttonStyle(.plain) // iOS 15+ shorthand
+            #endif
             .foregroundColor(.white)
         }
         .background(Color.black.edgesIgnoringSafeArea(.all))
@@ -601,14 +568,18 @@ struct ContentView: View {
             try? await tab.saveTabState()
         }
         tab.close()
+        tab.deleteTabFile()
 
         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
             containers[selectedContainerIndex].tabs.remove(at: index)
 
             // Ensure there's always at least one tab
             if containers[selectedContainerIndex].tabs.isEmpty {
-                addTab()
+                let container = containers[selectedContainerIndex]
+                let newTab = BrowserTab(title: "New Tab", url: nil, dataStore: container.dataStore, containerFolder: container.folderURL)
+                containers[selectedContainerIndex].tabs.append(newTab)
                 selectedTabIndex = 0
+                newTab.persistState()
             } else if selectedTabIndex >= containers[selectedContainerIndex].tabs.count {
                 // If we closed the last tab, move selection to the previous tab
                 selectedTabIndex = containers[selectedContainerIndex].tabs.count - 1
@@ -654,18 +625,34 @@ struct ContentView: View {
 
 // MARK: - WebView
 
-struct WebViewContainer: NSViewRepresentable {
+struct WebViewContainer: PlatformViewRepresentable {
     @ObservedObject var tab: BrowserTab
 
     func makeCoordinator() -> Coordinator { Coordinator(tab: tab) }
 
+    #if os(macOS)
     func makeNSView(context: Context) -> WKWebView {
         let webView = tab.webView!
         webView.navigationDelegate = context.coordinator
         return webView
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) { }
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    #elseif os(iOS)
+    func makeUIView(context: Context) -> WKWebView {
+        guard let webView = tab.webView else {
+            let config = WKWebViewConfiguration()
+            config.preferences.javaScriptCanOpenWindowsAutomatically = true
+            let newWebView = WKWebView(frame: .zero, configuration: config)
+            tab.webView = newWebView
+            return newWebView
+        }
+        webView.navigationDelegate = context.coordinator
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    #endif
 
     class Coordinator: NSObject, WKNavigationDelegate {
         var tab: BrowserTab
@@ -675,26 +662,23 @@ struct WebViewContainer: NSViewRepresentable {
             DispatchQueue.main.async {
                 self.tab.url = webView.url
                 self.tab.addressFieldText = webView.url?.absoluteString ?? ""
-                if let title = webView.title, !title.isEmpty {
-                    self.tab.title = title
-                }
-
-                let config = WKSnapshotConfiguration()
-                config.afterScreenUpdates = true
-                webView.takeSnapshot(with: config) { image, _ in
-                    if let cgImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                        self.tab.preview = NSImage(cgImage: cgImage, size: NSSize(width: 400, height: 300))
-                    }
-                }
+                if let title = webView.title, !title.isEmpty { self.tab.title = title }
+                self.tab.persistState()
             }
-        }
 
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
-                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
-            if let scheme = url.scheme?.lowercased(), ["http", "https", "about"].contains(scheme) {
-                decisionHandler(.allow)
-            } else { decisionHandler(.cancel) }
+            let config = WKSnapshotConfiguration()
+            config.afterScreenUpdates = true
+            webView.takeSnapshot(with: config) { image, _ in
+                #if os(macOS)
+                if let cgImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                    self.tab.preview = NSImage(cgImage: cgImage, size: NSSize(width: 400, height: 300))
+                }
+                #elseif os(iOS)
+                if let image = image {
+                    self.tab.preview = image
+                }
+                #endif
+            }
         }
     }
 }
@@ -759,15 +743,26 @@ struct WebAddressField: View {
             "Search or enter an address...",
             text: $tab.addressFieldText,
             onEditingChanged: { isEditing in
-                if !isEditing {
-                    if tab.addressFieldText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        tab.addressFieldText = tab.url?.absoluteString ?? tab.url?.absoluteString ?? ""
-                    }
+                if !isEditing, tab.addressFieldText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    tab.addressFieldText = tab.url?.absoluteString ?? ""
                 }
             },
             onCommit: commit
         )
-        .textFieldStyle(RoundedBorderTextFieldStyle())
+        .padding(6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                #if os(macOS)
+                .fill(Color(NSColor.windowBackgroundColor)) // dynamic with system appearance
+                #elseif os(iOS)
+                .fill(Color(UIColor.black))
+                #endif
+        )
+        .foregroundColor(.primary)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.gray.opacity(0.5), lineWidth: 1)
+        )
     }
 
     private func commit() {
