@@ -15,6 +15,30 @@ import WebKit
 import Combine
 import UniformTypeIdentifiers
 
+// MARK: Site Identifier
+
+extension URL {
+    var siteIdentifier: String? {
+        host?.lowercased() // includes subdomains
+    }
+}
+
+// MARK: Per-site Datastore
+
+final class SiteDataStoreManager {
+    static var stores: [String: WKWebsiteDataStore] = [:]
+
+    static func store(for url: URL?) -> WKWebsiteDataStore {
+        guard let url = url, let site = url.siteIdentifier else {
+            return WKWebsiteDataStore.default()
+        }
+        if let existing = stores[site] { return existing }
+        let newStore = WKWebsiteDataStore.default()
+        stores[site] = newStore
+        return newStore
+    }
+}
+
 // MARK: - Browser Tab
 
 final class BrowserTab: NSObject, ObservableObject, Identifiable {
@@ -28,17 +52,19 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     
     var webView: WKWebView?
 
-    init(title: String = "New Tab", url: URL? = nil, dataStore: WKWebsiteDataStore, groupFolder: URL) {
+    init(title: String = "New Tab", url: URL? = nil, groupFolder: URL) {
         self.title = title
         self.url = url
         self.addressFieldText = url?.absoluteString ?? ""
         self.groupFolder = groupFolder
         super.init()
 
+        let storeToUse = SiteDataStoreManager.store(for: url)
+
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
-        config.websiteDataStore = dataStore
-        
+        config.websiteDataStore = storeToUse
+
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
         self.webView = webView
@@ -105,7 +131,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
 }
 
 extension BrowserTab {
-    convenience init?(fromFile fileURL: URL, dataStore: WKWebsiteDataStore) {
+    convenience init?(fromFile fileURL: URL) {
         guard let data = try? Data(contentsOf: fileURL),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
@@ -114,7 +140,7 @@ extension BrowserTab {
         let title = dict["title"] as? String ?? "New Tab"
         let url = (dict["url"] as? String).flatMap { URL(string: $0) }
         
-        self.init(title: title, url: url, dataStore: dataStore, groupFolder: fileURL.deletingLastPathComponent())
+        self.init(title: title, url: url, groupFolder: fileURL.deletingLastPathComponent())
         self.id = id
     }
 }
@@ -126,7 +152,6 @@ struct TabGroup: Identifiable {
     var name: String
     var tabs: [BrowserTab]
     var folderURL: URL
-    var dataStore: WKWebsiteDataStore
 }
 
 struct TabGroupsManager {
@@ -160,9 +185,9 @@ struct TabGroupsManager {
             guard let folderPath = dict["folder"] else { continue }
             let folderURL = URL(fileURLWithPath: folderPath)
             let files = (try? FileManager.default.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil)) ?? []
-            let tabs = files.compactMap { BrowserTab(fromFile: $0, dataStore: WKWebsiteDataStore.nonPersistent()) }
+            let tabs = files.compactMap { BrowserTab(fromFile: $0) }
             if !tabs.isEmpty {
-                let group = TabGroup(name: dict["name"] ?? "Group", tabs: tabs, folderURL: folderURL, dataStore: WKWebsiteDataStore.nonPersistent())
+                let group = TabGroup(name: dict["name"] ?? "Group", tabs: tabs, folderURL: folderURL)
                 groups.append(group)
             }
         }
@@ -179,15 +204,12 @@ extension TabGroup {
             .appendingPathComponent("WaveData")
             .appendingPathComponent("TabGroups")
             .appendingPathComponent(domain)
-        
+
         try? FileManager.default.createDirectory(at: baseFolder, withIntermediateDirectories: true)
-        
-        // Each tab group gets a unique data store
-        let store = WKWebsiteDataStore.nonPersistent()
-        
-        let initialTab = BrowserTab(title: "New Tab", url: url, dataStore: store, groupFolder: baseFolder)
-        
-        return TabGroup(name: groupName, tabs: [initialTab], folderURL: baseFolder, dataStore: store)
+
+        let initialTab = BrowserTab(title: "New Tab", url: url, groupFolder: baseFolder)
+
+        return TabGroup(name: groupName, tabs: [initialTab], folderURL: baseFolder)
     }
     
     func saveAllTabs() {
@@ -275,12 +297,7 @@ struct ContentView: View {
 
         // Ensure the selected group's tabs array is not empty
         if tabGroups[selectedGroupIndex].tabs.isEmpty {
-            let newTab = BrowserTab(
-                title: "New Tab",
-                url: nil,
-                dataStore: tabGroups[selectedGroupIndex].dataStore,
-                groupFolder: tabGroups[selectedGroupIndex].folderURL
-            )
+            let newTab = BrowserTab(title: "New Tab", url: nil, groupFolder: tabGroups[selectedGroupIndex].folderURL)
             tabGroups[selectedGroupIndex].tabs = [newTab]
             selectedTabIndex = 0
         }
@@ -383,7 +400,17 @@ struct ContentView: View {
             HStack {
                 Spacer()
                 TextField("Search \(tabGroups[selectedGroupIndex].name)...", text: $searchQuery)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .padding(6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            #if os(macOS)
+                            .fill(Color(NSColor.windowBackgroundColor))
+                            #elseif os(iOS)
+                            .fill(Color(UIColor.black))
+                            #endif
+                    )
+                    .foregroundColor(.white)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.5), lineWidth: 1))
                     .frame(width: 300)
                 Spacer()
             }.padding(.top)
@@ -394,7 +421,11 @@ struct ContentView: View {
                         ZStack(alignment: .topTrailing) {
                             VStack(spacing: 6) {
                                 if let image = filteredTabs[index].preview {
+                                    #if os(macOS)
+                                    Image(nsImage: image).resizable().scaledToFill().frame(height: 120).clipped().cornerRadius(8)
+                                    #elseif os(iOS)
                                     Image(uiImage: image).resizable().scaledToFill().frame(height: 120).clipped().cornerRadius(8)
+                                    #endif
                                 } else {
                                     Rectangle().fill(Color.gray.opacity(0.3)).frame(height: 120).cornerRadius(8)
                                         .overlay(Text("Loading...").foregroundColor(.white.opacity(0.7)))
@@ -489,10 +520,10 @@ struct ContentView: View {
         withAnimation(.spring()) {
             let newTab = BrowserTab(
                 title: "New Tab",
-                url: nil,
-                dataStore: currentTab?.webView?.configuration.websiteDataStore ?? WKWebsiteDataStore.nonPersistent(),
+                url: nil, // no initial URL
                 groupFolder: tabGroups[selectedGroupIndex].folderURL
             )
+
             tabGroups[selectedGroupIndex].tabs.append(newTab)
             TabGroupsManager.saveGroups(tabGroups)
             selectedTabIndex = tabGroups[selectedGroupIndex].tabs.count - 1
@@ -555,7 +586,6 @@ struct ContentView: View {
         }
     }
 }
-
 
 // MARK: - WebViewContainer
 
@@ -671,7 +701,7 @@ struct WebAddressField: View {
                 .fill(Color(UIColor.black))
                 #endif
         )
-        .foregroundColor(.primary)
+        .foregroundColor(.white)
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.5), lineWidth: 1))
     }
 
