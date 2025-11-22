@@ -19,7 +19,7 @@ import UniformTypeIdentifiers
 
 extension URL {
     var siteIdentifier: String? {
-        host?.lowercased() // includes subdomains
+        host?.lowercased()
     }
 }
 
@@ -103,7 +103,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     func saveTabState() async throws {
         guard let webView = webView else { return }
         let state: [String: Any] = [
-            "url": webView.url?.absoluteString ?? "",
+            "url": self.url?.absoluteString ?? "",
             "title": title
         ]
         let fileURL = groupFolder.appendingPathComponent("\(self.id.uuidString).json")
@@ -114,7 +114,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     func saveTabStateSync() {
         guard let webView = webView else { return }
         let state: [String: Any] = [
-            "url": webView.url?.absoluteString ?? "",
+            "url": self.url?.absoluteString ?? "",
             "title": title
         ]
         let fileURL = groupFolder.appendingPathComponent("\(self.id.uuidString).json")
