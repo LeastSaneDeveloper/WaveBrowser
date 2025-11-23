@@ -101,7 +101,6 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     }
 
     func saveTabState() async throws {
-        guard let webView = webView else { return }
         let state: [String: Any] = [
             "url": self.url?.absoluteString ?? "",
             "title": title
@@ -112,7 +111,6 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     }
     
     func saveTabStateSync() {
-        guard let webView = webView else { return }
         let state: [String: Any] = [
             "url": self.url?.absoluteString ?? "",
             "title": title
