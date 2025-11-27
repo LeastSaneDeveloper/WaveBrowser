@@ -663,7 +663,7 @@ struct TabButton: View {
                 HStack {
                     Color.clear.frame(width: 20)
                     Spacer()
-                    Text(tab.title).font(.system(size: 13, weight: .medium)).foregroundColor(.white).minimumScaleFactor(0.6).lineLimit(1)
+                    Text(tab.title).font(.system(size: 13, weight: .medium)).foregroundColor(.white).lineLimit(1)
                     Spacer()
                     Button(action: closeAction) {
                         Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundColor(.white.opacity(0.8))
